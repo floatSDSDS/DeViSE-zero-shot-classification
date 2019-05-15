@@ -10,13 +10,13 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 import math
-
 import torch.nn as nn
 
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
+from scipy.stats import entropy
 
 a = Random()
 a.seed(1)
@@ -26,12 +26,13 @@ test_description='testDeVise'
 rep_num = 1
 id_split=range(0,10)
 # SNIP, SMP18
-choose_dataset="SNIP"
+choose_dataset="SMP18"
 choose_model=['DeViSE']
 # without seen: 0, with seen: 1, fixed with some classes: -1
 dataSetting={}
 dataSetting['test_mode']=1
 retrainLSTM=False
+
 ######
 dataSetting['random_class']=False
 dataSetting['training_prob']=0.8
@@ -80,6 +81,7 @@ def setting(data):
     config['vocab_size'] = vocab_size # vocab size of word vectors (10,895)
     config['num_epochs'] = 10 # number of epochs
     config['num_epochs2']= 20
+    config['downWeight']=0.6
     config['max_time'] = max_time
     config['sample_num'] = sample_num #sample number of training data
     config['test_num'] = test_num #number of test data
@@ -156,8 +158,9 @@ def loss_devise(pred_emb,y_id,labels_emb):
     return sum(val)/(len(val))
 #%% zsl_evaluate
 
-def zsl_evaluate(data,config,mymodel,newnet):
+def zsl_evaluate(data,config,mymodel,newnet,epoch):
     
+    iwantvisualize=[0,19,100]
     newnet.eval()    
     mymodel.eval()
     
@@ -169,7 +172,6 @@ def zsl_evaluate(data,config,mymodel,newnet):
         x_te = x_te.cuda(cuda_id)
         u_len = u_len.cuda(cuda_id)
     
-    total_unseen_pred = np.array([], dtype=np.int64)
     total_y_test = np.array([], dtype=np.int64)
     
     with torch.no_grad():
@@ -195,27 +197,31 @@ def zsl_evaluate(data,config,mymodel,newnet):
         
         outp2=newnet(outp)
         
-        sc_no=data['uc_vec'].shape[0]
-        outp2_=torch.unsqueeze(outp2.float(),1).repeat(1,sc_no,1) 
+        uc_no=data['uc_vec'].shape[0]
+        sc_no=data['sc_vec'].shape[0]
+        outp2_=torch.unsqueeze(outp2.float(),1).repeat(1,uc_no,1) 
         bsz=outp2_.shape[0] 
-        labels_emb_=torch.from_numpy(data['uc_vec']).cuda() 
-        labels_emb_=torch.unsqueeze(labels_emb_,0).repeat(bsz,1,1) 
-        sim=F.cosine_similarity(outp2_,labels_emb_,dim=2) 
-        unseen_pred=torch.argmax(sim,dim=1)
         
-#        for activation in outp2:
-#            predtemp=activation.cpu().numpy()
-#            predtemp=np.reshape(predtemp,(1,predtemp.shape[0]))
-#            sim=cosine_similarity(predtemp,data['uc_vec'])
-#            print(sim)
-#            prd=np.argmax(sim,1)
-#            total_unseen_pred = np.concatenate((total_unseen_pred, prd))
+        labels_emb_=torch.from_numpy(data['uc_vec']).cuda() 
+        labels_emb_=torch.unsqueeze(labels_emb_,0).repeat(bsz,1,1)
+        sim=F.cosine_similarity(outp2_,labels_emb_,dim=2) # [bsz, uc_no]
+#        print(sim)
+        
+        downSWeight=torch.ones(bsz,uc_no)
+        if uc_no>sc_no:
+#            entropy_sim=torch.tensor([entropy(s) for s in torch.clamp(sim,min=0.001,max=9999).cpu()]) # [bsz,1]
+#            entropy_sim-=entropy_sim.mean()
+#            entropy_sim=torch.clamp(entropy_sim,0,9999).reshape(-1,1)
+            downSWeight[:,range(sc_no)]*=config['downWeight']
+            sim=sim.mul(downSWeight.cuda())
             
+        unseen_pred=torch.argmax(sim,dim=1)
+#        sio.savemat('embNew/sim_'+config['dataset']+time.strftime('%y%m%d%I%M%S')+'.mat',dict(sim=sim.cpu().numpy(),te_emb=outp2_,y_label=batch_test))
         total_y_test = np.concatenate((total_y_test, batch_test))
-        acc=accuracy_score(total_y_test,unseen_pred)
+        acc=accuracy_score(total_y_test,unseen_pred.cpu())
         print('                     '+ config['dataset']+" ZStest Perfomance")
-        print (classification_report(total_y_test, unseen_pred, digits=4))
-        logclasses=precision_recall_fscore_support(total_y_test, unseen_pred)
+        print (classification_report(total_y_test, unseen_pred.cpu(), digits=4))
+        logclasses=precision_recall_fscore_support(total_y_test, unseen_pred.cpu())
     return acc,logclasses
 #%% load data
     
@@ -414,30 +420,28 @@ for rep_no in range(rep_num):
             batch_emb=batch_emb.cuda()
             optimizer2.zero_grad()
             outp=newnet(batch_emb)  
-            loss_val2=loss_devise(outp,batch_y_id,data['sc_vec'])
+#            loss_val2=loss_devise(outp,batch_y_id,data['sc_vec'])
 #            print('loss: ',loss_val2)
 
-#            loss_val2=(1-F.cosine_similarity(outp.float().cuda(), batch_label)).mean()
-#            print(F.cosine_similarity(outp.float().cuda(), batch_label))
+            loss_val2=(1-F.cosine_similarity(outp.float().cuda(), batch_label)).mean()
             loss_val2.backward()
             optimizer2.step()
             avg_loss+=loss_val2
             
-            total_unseen_pred=np.array([])
-            for activation in outp:
-                predtemp=activation.cpu().detach().numpy()
-                predtemp=np.reshape(predtemp,(1,predtemp.shape[0]))
-                sim=cosine_similarity(predtemp,data['sc_vec'])
-    #            print(sim)
-                prd=np.argmax(sim,1)
-                total_unseen_pred = np.concatenate((total_unseen_pred, prd))
-                
-            acc_tr=accuracy_score(batch_y_id.cpu(),total_unseen_pred)
+            sc_no=data['sc_vec'].shape[0]
+            outp_=torch.unsqueeze(outp.float(),1).repeat(1,sc_no,1) 
+            bsz=outp_.shape[0] 
+            labels_emb_=torch.from_numpy(data['sc_vec']).cuda() 
+            labels_emb_=torch.unsqueeze(labels_emb_,0).repeat(bsz,1,1) 
+            sim=F.cosine_similarity(outp_,labels_emb_,dim=2) 
+            unseen_pred=torch.argmax(sim,dim=1)
+            
+            acc_tr=accuracy_score(batch_y_id.cpu(),unseen_pred.cpu())
             avg_acc_tr+=acc_tr
 
         # test       
         train_time = time.time() - epoch_time
-        acc,logC=zsl_evaluate(data,config,mymodel,newnet)
+        acc,logC=zsl_evaluate(data,config,mymodel,newnet,epoch)
         
         # log and output
         if acc>best_acc:
